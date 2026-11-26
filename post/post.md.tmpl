@@ -4,6 +4,7 @@ date = "2026-11-25"
 categories = ["Engineering", "Data"]
 tags = ["duckdb", "jq", "json", "benchmark", "cli", "performance", "simdjson"]
 type = "posts"
+description = "Lemire's sjq benchmark, redone with the DuckDB 2.0 CLI reading JSON from stdin: 10-36x faster than jq, capped by pipes, and not as streaming as it looks."
 draft = false
 +++
 
@@ -78,16 +79,15 @@ DuckDB's best NDJSON number goes from **{{v:pipe.03.duckdb.gbps}} GB/s** through
 
 Is the pipe itself too slow? No: `cat tweets.ndjson | cat > /dev/null` moves the whole gigabyte in 0.16 s, about 6.7 GB/s.
 The limit is how DuckDB *consumes* a non-seekable stream.
-With a regular file, every thread can seek to its own byte range and parse it in parallel.
-With a pipe, something has to read the stream in order and hand out buffers, and that something becomes the bottleneck.
+My guess, which I haven't verified in DuckDB's source: with a regular file every thread can seek to its own byte range, but with a pipe the stream has to be read in order and handed out, and that serial step becomes the bottleneck.
 
 I swept `SET threads=N` on the field-extraction query:
 
 {{chart:threads}}
 
 With a redirect, it scales nicely up to about 16 threads.
-Through a pipe it tops out around **4 threads** at roughly 2.4 GB/s, then gets *slower* as more threads fight over the same input buffers.
-If you have to pipe into DuckDB, `SET threads=4` is a free speedup over the default.
+Through a pipe it tops out around **4 threads** at roughly 2.4 GB/s, then gets *slower* as more threads are added.
+If you have to pipe into DuckDB, try `SET threads=4`. On this workload and machine it beat the default, but that's one query measured best-of-3, so check it on yours.
 
 ## "Streaming" is doing a lot of work in that sentence
 
