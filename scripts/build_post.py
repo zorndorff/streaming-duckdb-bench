@@ -27,7 +27,8 @@ def load(mode):
     return out
 
 
-PIPE, REDIR, UNNEST = load("pipe"), load("redirect"), load("pipe-unnest")
+PIPE, REDIR, UNNEST, FILE = load("pipe"), load("redirect"), load("pipe-unnest"), load("file")
+PCOPY, RCOPY = load("pipe-copy"), load("redirect-copy")
 SWEEP = [l.split() for l in open(os.path.join(RES, "threads_sweep.txt")).read().splitlines()[1:]]
 
 STYLE = """<style>
@@ -95,16 +96,20 @@ def bars_svg(d, xmax):
 
 
 def chart_bars():
-    xmax = math.ceil(max(gbps(REDIR, r, "duckdb") for r in REDIR))
+    xmax = math.ceil(max(gbps(d, r, "duckdb") for d in (REDIR, RCOPY, FILE) for r in d))
     lg = legend([(n, c) for _, n, c in SERIES])
     return f'''<div class="bv" id="bv-bars">
 <div class="tabs" role="group" aria-label="input mode">
 <button aria-pressed="true" data-m="pipe">pipe: cat file | duckdb</button>
 <button aria-pressed="false" data-m="redirect">redirect: duckdb &lt; file</button>
+<button aria-pressed="false" data-m="rcopy">redirect + COPY TO stdout</button>
+<button aria-pressed="false" data-m="file">no stdin: path → COPY TO file</button>
 </div>{lg}
 <div data-p="pipe">{bars_svg(PIPE, xmax)}</div>
 <div data-p="redirect" hidden>{bars_svg(REDIR, xmax)}</div>
-<div class="cap">Throughput = input bytes ÷ mean wall time (hyperfine, 3 runs of jq, 10 of DuckDB). Higher is better. Same scale on both tabs.</div>
+<div data-p="rcopy" hidden>{bars_svg(RCOPY, xmax)}</div>
+<div data-p="file" hidden>{bars_svg(FILE, xmax)}</div>
+<div class="cap">Throughput = input bytes ÷ mean wall time (hyperfine, 3 runs of jq, 10 of DuckDB). Higher is better. Same scale on every tab. In the last tab jq also reads the path (<code>jq … file &gt; out</code>), as in Lemire's runs.</div>
 <script>(function(){{var r=document.getElementById("bv-bars");r.querySelectorAll("button").forEach(function(b){{b.onclick=function(){{r.querySelectorAll("button").forEach(function(x){{x.setAttribute("aria-pressed",x===b)}});r.querySelectorAll("[data-p]").forEach(function(p){{p.hidden=p.dataset.p!==b.dataset.m}})}}}})}})();</script>
 </div>'''
 
@@ -179,33 +184,76 @@ def chart_hero():
     return '<div class="bv-hero">' + "".join(f"<div><b>{a}</b><span>{b}</span></div>" for a, b in tiles) + "</div>"
 
 
+DATA = {"pipe": PIPE, "redir": REDIR, "file": FILE}
+ALL = dict(DATA, pcopy=PCOPY, rcopy=RCOPY)
+MODES = (("pipe", "pipe"), ("redir", "redirect"), ("rcopy", "redirect + COPY stdout"), ("file", "no stdin"))
+
+
 def table():
-    h = "| workload | jq | pipe 1t | pipe 32t | pipe vs jq | redirect 1t | redirect 32t | redirect vs jq |\n|---|---|---|---|---|---|---|---|\n"
+    """DuckDB 32 threads, mean seconds, × vs jq run the same way."""
+    h = "| workload | jq (stdin) | " + " | ".join(f"DuckDB, {n}" for _, n in MODES) + " |\n|---|---|" + "---|" * len(MODES) + "\n"
     for rid in sorted(PIPE):
-        p, r = PIPE[rid], REDIR[rid]
-        doc = " (doc)" if p["file"] == "timeline.json" else ""
-        h += (f'| {p["label"]}{doc} | {p["jq"]:.2f} s | {p["duckdb1"]:.2f} s | {p["duckdb"]:.2f} s | {p["jq"] / p["duckdb"]:.1f}× '
-              f'| {r["duckdb1"]:.2f} s | {r["duckdb"]:.2f} s | {r["jq"] / r["duckdb"]:.1f}× |\n')
+        doc = " (doc)" if PIPE[rid]["file"] == "timeline.json" else ""
+        cells = [f'{ALL[m][rid]["duckdb"]:.2f} s ({ALL[m][rid]["jq"] / ALL[m][rid]["duckdb"]:.1f}×)' for m, _ in MODES]
+        h += f'| {PIPE[rid]["label"]}{doc} | {PIPE[rid]["jq"]:.2f} s | ' + " | ".join(cells) + " |\n"
     return h
 
 
 def mem_table():
-    h = "| workload | jq | DuckDB 1t, pipe | DuckDB 32t, pipe | DuckDB 1t, redirect | DuckDB 32t, redirect |\n|---|---|---|---|---|---|\n"
+    h = "| workload | jq | DuckDB 1t, pipe | DuckDB 1t, by path | DuckDB 32t, pipe | DuckDB 32t, by path |\n|---|---|---|---|---|---|\n"
     mib = lambda b: f"{b / 2**20:,.0f} MiB"
     for rid in ("03", "06", "08"):
-        p, r = PIPE[rid], REDIR[rid]
+        p, f = PIPE[rid], FILE[rid]
         doc = " (doc)" if p["file"] == "timeline.json" else ""
-        h += f'| {rid} {p["label"]}{doc} | {mib(p["jq_mem"])} | {mib(p["duckdb1_mem"])} | {mib(p["duckdb_mem"])} | {mib(r["duckdb1_mem"])} | {mib(r["duckdb_mem"])} |\n'
+        h += (f'| {rid} {p["label"]}{doc} | {mib(p["jq_mem"])} | {mib(p["duckdb1_mem"])} | {mib(f["duckdb1_mem"])} '
+              f'| {mib(p["duckdb_mem"])} | {mib(f["duckdb_mem"])} |\n')
     return h
+
+
+def chart_output():
+    """DuckDB 32t, seconds, for the output-heavy workloads: how the rows get written."""
+    W, L, R = 720, 168, 64
+    paths = [("CLI prints rows (duckdb -list), stdin redirect", REDIR, "var(--secondary)", ""),
+             ("COPY … TO '/dev/stdout', stdin redirect", RCOPY, "var(--s3)", "url(#bv-hatch2)"),
+             ("read by path, COPY … TO file", FILE, "var(--s3)", "")]
+    ids = ["01", "02", "06", "08"]
+    bh, gap, grp = 11, 2, 16
+    H = 24 + len(ids) * (3 * bh + 2 * gap + grp)
+    xmax = 3.0
+    sx = lambda v: L + (W - L - R) * v / xmax
+    o = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="DuckDB wall time by output path">',
+         '<defs><pattern id="bv-hatch2" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
+         '<rect width="6" height="6" fill="var(--s3)"/><line x1="0" y1="0" x2="0" y2="6" stroke="var(--theme)" stroke-width="2.4"/></pattern></defs>']
+    for t in (0, 0.5, 1, 1.5, 2, 2.5, 3):
+        o.append(f'<line class="g" x1="{sx(t):.1f}" x2="{sx(t):.1f}" y1="14" y2="{H - 4}"/>'
+                 f'<text class="m" x="{sx(t):.1f}" y="10" text-anchor="middle" font-size="11">{t:g} s</text>')
+    y = 24
+    for rid in ids:
+        r = PIPE[rid]
+        doc = " (1 doc)" if r["file"] == "timeline.json" else ""
+        o.append(f'<text class="t" x="{L - 10}" y="{y + 1.5 * bh + gap + 4}" text-anchor="end">{esc(r["label"])}{doc}</text>')
+        for name, d, col, fill in paths:
+            v = d[rid]["duckdb"]
+            o.append(f'<rect x="{L}" y="{y}" width="{sx(v) - L:.1f}" height="{bh}" rx="2" fill="{fill or col}"><title>{esc(name)}: {v:.2f} s</title></rect>'
+                     f'<text class="m" x="{sx(v) + 5:.1f}" y="{y + bh - 1.5}" font-size="10.5">{v:.2f} s</text>')
+            y += bh + gap
+        y += grp - gap
+    o.append("</svg>")
+    lg = ('<div class="lg">' + "".join(
+        f'<span><i style="background:{"repeating-linear-gradient(45deg,var(--s3) 0 3px,var(--theme) 3px 5px)" if fill else col}"></i>{esc(n)}</span>' for n, _, col, fill in paths) + "</div>")
+    return ('<div class="bv">' + lg + "".join(o) +
+            '<div class="cap">DuckDB at 32 threads, mean wall time, lower is better. Output size: minify 1.07 GB, pretty-print 1.48 GB, '
+            'regex 59 MB, document minify 622 MB. All three paths give byte-identical output.</div></div>')
 
 
 def values():
     v = {}
     for rid in PIPE:
-        for mode, d in (("pipe", PIPE), ("redir", REDIR)):
+        for mode, d in ALL.items():
             for key in ("jq", "duckdb1", "duckdb"):
                 v[f"{mode}.{rid}.{key}.s"] = f"{d[rid][key]:.2f}"
                 v[f"{mode}.{rid}.{key}.gbps"] = f"{gbps(d, rid, key):.2f}"
+                v[f"{mode}.{rid}.{key}.mib"] = f"{d[rid][key + '_mem'] / 2**20:,.0f}"
             v[f"{mode}.{rid}.x"] = f"{d[rid]['jq'] / d[rid]['duckdb']:.1f}"
             v[f"{mode}.{rid}.x1"] = f"{d[rid]['jq'] / d[rid]['duckdb1']:.1f}"
     nd = [r for r in PIPE if PIPE[r]["file"] == "tweets.ndjson"]
@@ -219,7 +267,7 @@ def main():
     src, dst = sys.argv[1], sys.argv[2]
     s = open(src).read()
     charts = {"style": STYLE, "hero": chart_hero(), "bars": chart_bars(), "threads": chart_threads(),
-              "unnest": chart_unnest(), "table": table(), "mem": mem_table()}
+              "unnest": chart_unnest(), "output": chart_output(), "table": table(), "mem": mem_table()}
     vals = values()
     s = re.sub(r"\{\{chart:(\w+)\}\}", lambda m: charts[m.group(1)], s)
     s = re.sub(r"\{\{v:([\w.]+)\}\}", lambda m: vals[m.group(1)], s)

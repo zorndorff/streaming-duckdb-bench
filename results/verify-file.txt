@@ -1,0 +1,19 @@
+01 minify (-c .)              tweets.ndjson  threads=1    OK
+01 minify (-c .)              tweets.ndjson  threads=all  OK
+02 pretty-print (.)           tweets.ndjson  threads=1    OK
+02 pretty-print (.)           tweets.ndjson  threads=all  OK
+03 extract a field            tweets.ndjson  threads=1    OK
+03 extract a field            tweets.ndjson  threads=all  OK
+04 select and build objects   tweets.ndjson  threads=1    OK
+04 select and build objects   tweets.ndjson  threads=all  OK
+05 string interpolation       tweets.ndjson  threads=1    OK
+05 string interpolation       tweets.ndjson  threads=all  OK
+06 regular expression         tweets.ndjson  threads=1    OK
+06 regular expression         tweets.ndjson  threads=all  OK
+07 count elements             timeline.json  threads=1    OK
+07 count elements             timeline.json  threads=all  OK
+08 minify (-c .)              timeline.json  threads=1    OK
+08 minify (-c .)              timeline.json  threads=all  OK
+09 group_by                   timeline.json  threads=1    OK
+09 group_by                   timeline.json  threads=all  OK
+note: 02 is compared against 'jq --indent 4 .' (json_pretty indents by 4)

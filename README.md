@@ -13,6 +13,8 @@ scripts/make_data.sh                 # data/full: tweets.ndjson (1 GB, 230,138 l
 scripts/verify.sh                    # md5: every DuckDB query == jq output, 1 thread and all threads
 scripts/run_bench.sh                 # hyperfine -> results/pipe/{NN-engine.json,index.tsv,summary.md}
 INPUT=redirect scripts/run_bench.sh  # same, with `cmd < file` instead of `cat file | cmd`
+INPUT=redirect OUTPUT=copy scripts/run_bench.sh  # DuckDB writes via COPY ... TO '/dev/stdout'
+INPUT=file scripts/run_bench.sh      # no stdin/stdout: DuckDB reads the path and COPYs to a file; jq reads the path
 ```
 
 For a quick pass, run `scripts/make_data.sh 64 data/small`, then `scripts/run_bench.sh data/small results/smoke`.
@@ -23,7 +25,8 @@ You need `jq`, `duckdb` (v2.0), `hyperfine` (2.x) and `python3`.
 
 | var | meaning |
 |---|---|
-| `INPUT` | `pipe` (default): `cat file \| cmd`, a non-seekable stream. `redirect`: `cmd < file`, where stdin is a seekable file. |
+| `INPUT` | `pipe` (default): `cat file \| cmd`, a non-seekable stream. `redirect`: `cmd < file`, where stdin is a seekable file. `file`: no stdin; DuckDB reads the path and writes `COPY … TO` a file, and jq gets the path and writes to a file. |
+| `OUTPUT` | `cli` (default): the CLI prints rows in `-list` mode. `copy`: the query is wrapped in `COPY … TO '/dev/stdout' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x1f')`, which is byte-identical to jq. Results go to `results/<input>-copy/`. |
 | `THREADS` | threads for the `duckdb` row (default `nproc`). The `duckdb 1t` row always uses `SET threads=1`. |
 | `SJQ` | path to an sjq binary. Adds `sjq` and `sjq -P` rows for a direct comparison. |
 | `ONLY`, `SKIP_JQ`, `RUNS`, `RUNS_JQ`, `PIN` | same meaning as in Lemire's script. `PIN` is a prefix such as `taskset -c 2` for the 1-thread runs. |
@@ -61,16 +64,21 @@ At 64 MB, process startup and the `cat` pipe dominate, so quote throughput only 
 The full tables, with peak RSS, are in `results/pipe/summary.md` and `results/redirect/summary.md`.
 These numbers come from an AMD Ryzen AI MAX+ 395 (32 threads) running Linux 7.2, jq 1.8.2, DuckDB v2.0.0 and hyperfine 2.0.
 
-| workload | jq | DuckDB 32t, pipe | DuckDB 32t, redirect |
-|---|---|---|---|
-| extract a field (1 GB NDJSON) | 6.91 s · 0.16 GB/s | 0.66 s · 1.63 GB/s (10.5×) | 0.19 s · 5.60 GB/s (35.8×) |
-| regex (1 GB NDJSON) | 15.23 s | 0.74 s (20.7×) | 0.66 s (23.1×) |
-| group_by (840 MB document) | 6.92 s | 2.55 s (2.7×) | 2.24 s (3.1×) |
+DuckDB at 32 threads, mean seconds (× vs jq run the same way):
+
+| workload | jq | pipe | redirect | redirect + COPY stdout | no stdin (path → COPY file) |
+|---|---|---|---|---|---|
+| minify (1 GB NDJSON) | 14.34 s | 1.26 s (11.4×) | 0.96 s (14.8×) | **0.32 s (44.7×)** | 0.51 s (29.2×) |
+| extract a field (1 GB NDJSON) | 6.91 s | 0.66 s (10.5×) | **0.19 s (35.8×)** | 0.20 s (35.0×) | 0.19 s (36.1×) |
+| regex (1 GB NDJSON) | 15.23 s | 0.74 s (20.7×) | 0.66 s (23.1×) | **0.27 s (56.6×)** | 0.28 s (55.3×) |
+| group_by (840 MB document) | 6.92 s | 2.55 s (2.7×) | 2.24 s (3.1×) | 2.10 s (3.3×) | 2.06 s (3.3×) |
 
 Findings:
 
 - **The pipe is the ceiling.** `cat | cat` moves 6.7 GB/s, but DuckDB reading a non-seekable `/dev/stdin` tops out around 4 threads at about 2.4 GB/s, then slows down. With `< file` it scales to 16 threads. See `results/threads_sweep.txt`.
-- **It is not bounded-memory streaming.** jq peaks at 4 MB. DuckDB peaks between 180 MiB and 6.7 GiB, and through a pipe on 1 thread, about the size of the input. `| head -1` still reads everything. `COPY … TO '/dev/stdout'` and `preserve_insertion_order=false` don't change that.
+- **Reading by path is no faster than `< file`.** A redirected stdin costs nothing (5.60 vs 5.53 GB/s on extract).
+- **The CLI's row printer is the other bottleneck.** For big outputs, `COPY … TO '/dev/stdout'` beats `-list` printing by 2–3× (minify 0.96 → 0.32 s), and it even beats letting DuckDB write the file itself. The fastest filter here is `duckdb < file` + `COPY TO '/dev/stdout'`.
+- **It is not bounded-memory streaming.** jq peaks at 4 MB. DuckDB peaks between 180 MiB and 6.7 GiB, and through a pipe on 1 thread, about the size of the input. `| head -1` still reads everything. `COPY … TO '/dev/stdout'` and `preserve_insertion_order=false` don't change that. Reading by path at 1 thread needs only ~200 MiB, but 32 threads still use 4–5 GiB, so most of the memory comes from the thread count, not stdin.
 - **Single document:** a 2.6–4.3× win with no thread scaling. Avoid `unnest` on the single huge row: 32 s against 2.5 s.
 - **Regex:** DuckDB rewrites `regexp_matches(t,'rt')` to `contains()`. The real-RE2 variant was faster still: 1.07 s on 1 thread and 0.45 s on 32, with a redirect (`results/variants/`).
-- Every query is md5-identical to jq in both input modes (`results/verify-redirect.txt`).
+- Every query is md5-identical to jq in every mode (`results/verify-*.txt`).

@@ -21,6 +21,16 @@ sql_for() { ls "$ROOT/sql/$1"-*.sql; }
 # AI_AGENT is set; -no-init so ~/.duckdbrc can't change settings.
 DUCK_FLAGS="-no-agent -no-init -list -noheader"
 
+# INPUT=file: no stdin/stdout at all. DuckDB reads the path and writes with
+# COPY ... TO a file (CSV, no quoting/escaping: byte-identical to jq's output);
+# jq is given the path and redirected to a file, as Lemire runs it.
+# file_sql ID DATAFILE OUTFILE -> writes the COPY version of sql/ID-*.sql to stdout.
+file_sql() {
+  local q
+  q=$(grep -v '^--' "$(sql_for "$1")" | tr '\n' ' ' | sed "s#/dev/stdin#$2#; s/; *\$//")
+  printf "COPY (%s) TO '%s' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\\x1f');\n" "$q" "$3"
+}
+
 # feed FILE CMD -> a shell string that streams FILE into CMD on stdin.
 #   INPUT=pipe      cat FILE | CMD   (non-seekable stdin; the default)
 #   INPUT=redirect  CMD < FILE       (stdin is a seekable regular file)
@@ -28,6 +38,6 @@ feed() {
   case "${INPUT:-pipe}" in
     pipe) echo "cat $1 | $2" ;;
     redirect) echo "$2 < $1" ;;
-    *) echo "INPUT must be pipe or redirect" >&2; exit 2 ;;
+    *) echo "feed: INPUT must be pipe or redirect" >&2; exit 2 ;;
   esac
 }

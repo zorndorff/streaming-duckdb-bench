@@ -11,10 +11,21 @@ fail=0
 for id in "${W_IDS[@]}"; do
   if [ -n "${ONLY:-}" ] && ! echo " $ONLY " | grep -q " $id "; then continue; fi
   file=$DATA/${W_FILE[$id]}; sql=$(sql_for "$id")
-  want=$(sh -c "$(feed "$file" "$JQ ${W_JQV[$id]}")" | md5sum | cut -d' ' -f1)
+  if [ "${OUTPUT:-cli}" = copy ]; then sql=$(mktemp --suffix .sql); file_sql "$id" /dev/stdin /dev/stdout > "$sql"; fi
+  if [ "${INPUT:-pipe}" = file ]; then
+    want=$(sh -c "$JQ ${W_JQV[$id]} $file" | md5sum | cut -d' ' -f1)
+  else
+    want=$(sh -c "$(feed "$file" "$JQ ${W_JQV[$id]}")" | md5sum | cut -d' ' -f1)
+  fi
   for t in 1 0; do
     tset=""; [ $t = 1 ] && tset="-cmd 'SET threads=1'"
-    got=$(sh -c "$(feed "$file" "$DUCKDB $DUCK_FLAGS $tset -f $sql")" | md5sum | cut -d' ' -f1)
+    if [ "${INPUT:-pipe}" = file ]; then
+      vout=$(mktemp); vsql=$(mktemp --suffix .sql); file_sql "$id" "$file" "$vout" > "$vsql"
+      sh -c "$DUCKDB $DUCK_FLAGS -no-stdin $tset -f $vsql"
+      got=$(md5sum < "$vout" | cut -d' ' -f1); rm -f "$vout" "$vsql"
+    else
+      got=$(sh -c "$(feed "$file" "$DUCKDB $DUCK_FLAGS $tset -f $sql")" | md5sum | cut -d' ' -f1)
+    fi
     st=OK; [ "$got" = "$want" ] || { st=DIFF; fail=1; }
     printf '%s %-26s %-14s threads=%-4s %s\n' "$id" "${W_LABEL[$id]}" "${W_FILE[$id]}" "$([ $t = 1 ] && echo 1 || echo all)" "$st"
   done

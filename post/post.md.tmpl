@@ -4,7 +4,7 @@ date = "2026-11-25"
 categories = ["Engineering", "Data"]
 tags = ["duckdb", "jq", "json", "benchmark", "cli", "performance", "simdjson"]
 type = "posts"
-description = "Lemire's sjq benchmark, redone with the DuckDB 2.0 CLI reading JSON from stdin: 10-36x faster than jq, capped by pipes, and not as streaming as it looks."
+description = "Lemire's sjq benchmark, redone with the DuckDB 2.0 CLI reading JSON from stdin: 10-57x faster than jq, capped by pipes and its own printer, and not as streaming as it looks."
 draft = false
 +++
 
@@ -25,7 +25,8 @@ Then I timed both tools with input streaming in on stdin.
 
 **The short version:** on newline-delimited JSON, DuckDB beats jq by **{{v:pipe.nd.x1.min}}–{{v:pipe.nd.x1.max}}×** on a single thread, through a plain pipe.
 Let it use every core and fed from a file, it reaches **{{v:redir.03.x}}×**.
-The two catches, a pipe that caps it and memory that is anything but streaming, turned out to be the most interesting part.
+Swap the CLI's row printer for `COPY … TO '/dev/stdout'` and the output-heavy jobs reach **{{v:rcopy.06.x}}×**, while it stays a stdin → stdout filter.
+The catches turned out to be the most interesting part: a pipe caps it, the CLI's printer slows it, and the memory use is anything but streaming.
 All the scripts and raw hyperfine results are in [zorndorff/streaming-duckdb-bench](https://github.com/zorndorff/streaming-duckdb-bench).
 
 ## The setup
@@ -58,10 +59,13 @@ Every one of the nine queries is checked against jq with md5 at full size, at 1 
 
 ## The results
 
-There are two ways to "stream into stdin", and DuckDB cares a lot about which one you use:
+There are two ways to "stream into stdin", and DuckDB cares a lot about which one you use.
+I also ran a variant that changes how DuckDB writes, and, for comparison, a setup with no stdin or stdout at all:
 
 - **Pipe:** `cat file | duckdb …`. stdin is a real pipe and can't be seeked.
 - **Redirect:** `duckdb … < file`. stdin is still a file descriptor, but the kernel hands DuckDB a regular, seekable file.
+- **Redirect + `COPY`:** same as redirect, but DuckDB writes with `COPY … TO '/dev/stdout'` instead of the CLI's row printer (explained below).
+- **No stdin:** DuckDB reads the path itself (`read_ndjson_objects('tweets.ndjson')`) and writes with `COPY … TO 'out.txt'`. jq gets the path too and redirects to a file, which is how Lemire ran it.
 
 Use the tabs to switch between them:
 
@@ -69,8 +73,10 @@ Use the tabs to switch between them:
 
 jq is a flat 0.07–0.16 GB/s whichever way you feed it.
 DuckDB's best NDJSON number goes from **{{v:pipe.03.duckdb.gbps}} GB/s** through a pipe to **{{v:redir.03.duckdb.gbps}} GB/s** with a redirect.
+Reading the path directly is no faster ({{v:file.03.duckdb.gbps}} GB/s), so a redirected stdin costs nothing.
+The workloads with big outputs do change, though, and that's the next surprise.
 
-<details><summary>Full numbers (mean seconds)</summary>
+<details><summary>Full numbers (DuckDB at 32 threads, mean seconds, × vs jq run the same way)</summary>
 
 {{chart:table}}
 </details>
@@ -89,6 +95,35 @@ With a redirect, it scales nicely up to about 16 threads.
 Through a pipe it tops out around **4 threads** at roughly 2.4 GB/s, then gets *slower* as more threads are added.
 If you have to pipe into DuckDB, try `SET threads=4`. On this workload and machine it beat the default, but that's one query measured best-of-3, so check it on yours.
 
+## The other bottleneck is the CLI's printer
+
+In the last two tabs, minify and regex jump ahead even though reading the file is no faster.
+The only other thing that changed is how rows get *out*.
+By default the CLI renders each result row in `-list` mode.
+`COPY … TO` hands the rows to DuckDB's CSV writer instead.
+With quoting and escaping switched off, that writer produces the same bytes as jq: `QUOTE ''`, `ESCAPE ''`, and a delimiter that never appears.
+And `COPY` can target `/dev/stdout`, so you keep a Unix filter:
+
+```bash
+duckdb -c "COPY (SELECT json(json) FROM read_ndjson_objects('/dev/stdin'))
+           TO '/dev/stdout' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '', DELIMITER '\x1f')" \
+  < tweets.ndjson > out.ndjson
+```
+
+I re-ran all nine workloads that way, through both a pipe and a redirect, and every output was md5-identical to jq's.
+The gain depends on how much the query writes:
+
+{{chart:output}}
+
+With a redirect, minifying 1 GB drops from {{v:redir.01.duckdb.s}} s to **{{v:rcopy.01.duckdb.s}} s** ({{v:rcopy.01.duckdb.gbps}} GB/s, {{v:rcopy.01.x}}× jq).
+That's faster than the no-stdin run ({{v:file.01.duckdb.s}} s), which also has to write a 1 GB file.
+Regex goes from {{v:redir.06.duckdb.s}} s to **{{v:rcopy.06.duckdb.s}} s** ({{v:rcopy.06.x}}× jq).
+Queries with tiny outputs, like extract a field, don't move.
+Through a real pipe, `COPY` still helps minify ({{v:pipe.01.duckdb.s}} s → {{v:pcopy.01.duckdb.s}} s), but the pipe's read ceiling caps everything else at about 1.7 GB/s.
+The single 840 MB document doesn't care either way.
+
+**So the fastest DuckDB filter I found is `duckdb < file` plus `COPY … TO '/dev/stdout'`**: it's still stdin → stdout, and it matches or beats letting DuckDB own the files.
+
 ## "Streaming" is doing a lot of work in that sentence
 
 This is the part that surprised me.
@@ -97,10 +132,13 @@ DuckDB is a query engine that happens to read a stream:
 
 {{chart:mem}}
 
-Through a pipe on one thread, DuckDB's peak memory is about the size of the input.
-It looks like it buffers the stream rather than processing it in bounded memory.
+There are two separate effects here.
+Through a pipe on one thread, DuckDB's peak memory is about the size of the input (~1.2 GiB).
+Read the same file by path on one thread and it needs only ~200 MiB, so the pipe case looks like DuckDB buffering the stream.
+At 32 threads, memory climbs to 4–5 GiB *even when reading by path*, so most of that is the parallel scan's per-thread buffers, not stdin.
 `… | head -1` doesn't save you either: it still read the full gigabyte, in the same time and the same ~5 GB of memory.
-Switching the output to `COPY … TO '/dev/stdout'`, or setting `preserve_insertion_order=false`, made no difference.
+Writing with `COPY … TO '/dev/stdout'`, or setting `preserve_insertion_order=false`, didn't change memory.
+If memory matters, `SET threads` is the knob.
 For a 1 GB file on a 128 GB box that's fine. For an endless `tail -f` log, reach for jq or sjq.
 
 ## One big document: modest wins, and one trap
@@ -132,14 +170,14 @@ FROM read_json_objects('/dev/stdin', format='unstructured',
 - **Regex (06):** DuckDB's optimizer quietly rewrites `regexp_matches(t, 'rt')` into `contains(t, 'rt')`, so the headline number isn't a regex at all. Forcing RE2 with the equivalent pattern `'(rt)'` gives the same output and was actually *faster*: 1.07 s on 1 thread and 0.45 s on 32, both with a redirect. Also, `lower()` is Unicode-aware while jq's `ascii_downcase` isn't. They agree on this data, but not on every input.
 - **Equivalence is per dataset.** The SQL matches jq on these files, but NULL printing, missing fields and malformed lines would behave differently.
 - **No sjq row.** I didn't run sjq on this machine, so I can't put it on these charts. The harness takes `SJQ=/path/to/sjq` if you want the real head-to-head.
-- **Method:** hyperfine with 3 runs of jq and 10 of DuckDB, one warm-up each, and the files in page cache. The 1-thread runs aren't CPU-pinned.
+- **Method:** hyperfine with 3 runs of jq and 10 of DuckDB, one warm-up each, and the files in page cache. The 1-thread runs aren't CPU-pinned. In the stdin modes, output goes to `/dev/null`; in the no-stdin mode both tools write a real file, which lands in page cache. The `COPY`-to-stdout runs reuse the jq timings from the same input mode.
 
 ## So, should you alias jq to DuckDB?
 
 No, but you should know it's there.
 jq is still the better *language* for poking at JSON, and sjq (go read Lemire's post) is in a different league for raw speed.
 What surprised me is how far a general-purpose SQL engine gets just by reading stdin.
-It's {{v:pipe.03.x}}× faster than jq through a pipe, and {{v:redir.03.x}}× when it can seek, with byte-identical output.
+It's {{v:pipe.03.x}}× faster than jq through a pipe, {{v:redir.03.x}}× when it can seek, and up to {{v:rcopy.06.x}}× once it skips the CLI's printer, with byte-identical output.
 And the moment the filter turns into a join, a window function or a `GROUP BY` over a hundred files, you're already holding the right tool.
 
 Run it yourself:
@@ -147,5 +185,7 @@ Run it yourself:
 ```bash
 git clone https://github.com/zorndorff/streaming-duckdb-bench && cd streaming-duckdb-bench
 scripts/make_data.sh && scripts/verify.sh && scripts/run_bench.sh
-INPUT=redirect scripts/run_bench.sh
+INPUT=redirect scripts/run_bench.sh                # duckdb < file
+INPUT=redirect OUTPUT=copy scripts/run_bench.sh    # ... + COPY TO '/dev/stdout'
+INPUT=file scripts/run_bench.sh                    # no stdin: read path, COPY TO file
 ```
