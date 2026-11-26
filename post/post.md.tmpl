@@ -1,0 +1,151 @@
++++
+title = "jq, Meet DuckDB: Streaming JSON Filters at 5.6 GB/s From a SQL Prompt"
+date = "2026-11-25"
+categories = ["Engineering", "Data"]
+tags = ["duckdb", "jq", "json", "benchmark", "cli", "performance", "simdjson"]
+type = "posts"
+draft = false
++++
+
+{{chart:style}}
+
+This morning Daniel Lemire published
+[Command-line JSON filtering at 20 GB/s](https://lemire.me/blog/2026/11/25/command-line-json-filtering-at-20-gb-s/).
+It introduces [sjq](https://github.com/simdjson/sjq), which runs the jq language on top of simdjson.
+On his 64-core Xeon, jq needs 11.5 seconds to pull `.user.screen_name` out of 1 GB of tweets.
+sjq does it in 0.31 s on one thread and 0.05 s on 32.
+
+My first thought was: *I already have a vectorized, multithreaded JSON engine on my PATH. It's called DuckDB.*
+DuckDB 2.0's CLI reads `/dev/stdin` and writes to stdout like any other Unix filter.
+So I took Lemire's nine workloads and his data generator, and wrote each jq filter as a SQL query.
+Then I timed both tools with input streaming in on stdin.
+
+{{chart:hero}}
+
+**The short version:** on newline-delimited JSON, DuckDB beats jq by **{{v:pipe.nd.x1.min}}–{{v:pipe.nd.x1.max}}×** on a single thread, through a plain pipe.
+Let it use every core and fed from a file, it reaches **{{v:redir.03.x}}×**.
+The two catches, a pipe that caps it and memory that is anything but streaming, turned out to be the most interesting part.
+All the scripts and raw hyperfine results are in [zorndorff/streaming-duckdb-bench](https://github.com/zorndorff/streaming-duckdb-bench).
+
+## The setup
+
+The inputs are the same files Lemire used, built by his `make_data.py` from simdjson's `twitter.json`:
+
+- `tweets.ndjson`: 1 GB, one tweet per line (230,138 lines).
+- `timeline.json`: one 840 MB pretty-printed `{"statuses": [...]}` document.
+
+The machine is my desk box, an AMD Ryzen AI MAX+ 395 with 32 threads, running jq 1.8.2, DuckDB v2.0.0 and hyperfine 2.0.
+It is a different machine from Lemire's, so don't compare my numbers with his directly.
+(jq alone takes 6.9 s here against his 11.5 s.)
+
+The trick on the DuckDB side is not to let it infer a schema.
+`read_json` would build a full typed struct for every tweet, nested entities and all.
+`read_ndjson_objects` hands back each line as a raw `JSON` value, and the `->>` operator pulls out only the path you ask for.
+That's the SQL version of sjq's "parse only what the filter needs", and it was about 5× faster than schema inference in my first tests:
+
+```bash
+# jq -r .user.screen_name
+cat tweets.ndjson | duckdb -list -noheader -c \
+  "SELECT json->>'\$.user.screen_name' FROM read_ndjson_objects('/dev/stdin')"
+```
+
+One DuckDB 2.0 gotcha: the CLI now has an "agent mode". If an AI-agent environment variable is set and stdout isn't a terminal, it switches to markdown tables with row caps.
+That's great for Claude and terrible for a Unix filter, so the bench passes `-no-agent -no-init` explicitly.
+
+Every one of the nine queries is checked against jq with md5 at full size, at 1 and 32 threads, through both a pipe and a redirect.
+**The output is byte-for-byte identical**, with a few honest asterisks I cover at the end.
+
+## The results
+
+There are two ways to "stream into stdin", and DuckDB cares a lot about which one you use:
+
+- **Pipe:** `cat file | duckdb …`. stdin is a real pipe and can't be seeked.
+- **Redirect:** `duckdb … < file`. stdin is still a file descriptor, but the kernel hands DuckDB a regular, seekable file.
+
+Use the tabs to switch between them:
+
+{{chart:bars}}
+
+jq is a flat 0.07–0.16 GB/s whichever way you feed it.
+DuckDB's best NDJSON number goes from **{{v:pipe.03.duckdb.gbps}} GB/s** through a pipe to **{{v:redir.03.duckdb.gbps}} GB/s** with a redirect.
+
+<details><summary>Full numbers (mean seconds)</summary>
+
+{{chart:table}}
+</details>
+
+## The pipe is the ceiling, and threads past four make it worse
+
+Is the pipe itself too slow? No: `cat tweets.ndjson | cat > /dev/null` moves the whole gigabyte in 0.16 s, about 6.7 GB/s.
+The limit is how DuckDB *consumes* a non-seekable stream.
+With a regular file, every thread can seek to its own byte range and parse it in parallel.
+With a pipe, something has to read the stream in order and hand out buffers, and that something becomes the bottleneck.
+
+I swept `SET threads=N` on the field-extraction query:
+
+{{chart:threads}}
+
+With a redirect, it scales nicely up to about 16 threads.
+Through a pipe it tops out around **4 threads** at roughly 2.4 GB/s, then gets *slower* as more threads fight over the same input buffers.
+If you have to pipe into DuckDB, `SET threads=4` is a free speedup over the default.
+
+## "Streaming" is doing a lot of work in that sentence
+
+This is the part that surprised me.
+jq really is a streaming filter: its peak RSS was **4 MiB** on every NDJSON workload.
+DuckDB is a query engine that happens to read a stream:
+
+{{chart:mem}}
+
+Through a pipe on one thread, DuckDB's peak memory is about the size of the input.
+It looks like it buffers the stream rather than processing it in bounded memory.
+`… | head -1` doesn't save you either: it still read the full gigabyte, in the same time and the same ~5 GB of memory.
+Switching the output to `COPY … TO '/dev/stdout'`, or setting `preserve_insertion_order=false`, made no difference.
+For a 1 GB file on a 128 GB box that's fine. For an endless `tail -f` log, reach for jq or sjq.
+
+## One big document: modest wins, and one trap
+
+On the single 840 MB `timeline.json`, DuckDB wins by {{v:redir.07.x}}–{{v:redir.08.x}}× and gets **no** benefit from threads.
+That makes sense: it's one JSON value, so it's one parse.
+
+The trap was `group_by`. My first version did the natural SQL thing: `unnest` the statuses array, then `GROUP BY`.
+It produced the correct answer… in **{{v:unnest.09.s}} seconds**, which is *nearly five times slower than jq*, with most of that time spent in the kernel.
+Pulling the strings out takes 2.5 s; the `unnest` cost the other 30.
+My best guess, which I haven't proven, is that each chunk `unnest` emits drags the 840 MB source value along with it.
+The fix is to never unnest at all and aggregate inside the list:
+
+```sql
+SELECT to_json(list_transform(
+         list_sort(map_entries(list_histogram(
+           json_extract_string(json, '$.statuses[*].user.lang')))),
+         lambda e: {'lang': e.key, 'n': e.value}))
+FROM read_json_objects('/dev/stdin', format='unstructured',
+                       maximum_object_size=4000000000);
+```
+
+{{chart:unnest}}
+
+## Fine print
+
+- **Pretty-print (02):** DuckDB's `json_pretty` indents by 4 spaces. Its output is byte-identical to `jq --indent 4 .`, but the benchmark times plain `jq .`.
+- **Minify (01, 08):** these use `json(json)`, which really parses and re-serializes. A bare `SELECT json` would be a passthrough and would only "match" because the input is already compact.
+- **Regex (06):** DuckDB's optimizer quietly rewrites `regexp_matches(t, 'rt')` into `contains(t, 'rt')`, so the headline number isn't a regex at all. Forcing RE2 with the equivalent pattern `'(rt)'` gives the same output and was actually *faster*: 1.07 s on 1 thread and 0.45 s on 32, both with a redirect. Also, `lower()` is Unicode-aware while jq's `ascii_downcase` isn't. They agree on this data, but not on every input.
+- **Equivalence is per dataset.** The SQL matches jq on these files, but NULL printing, missing fields and malformed lines would behave differently.
+- **No sjq row.** I didn't run sjq on this machine, so I can't put it on these charts. The harness takes `SJQ=/path/to/sjq` if you want the real head-to-head.
+- **Method:** hyperfine with 3 runs of jq and 10 of DuckDB, one warm-up each, and the files in page cache. The 1-thread runs aren't CPU-pinned.
+
+## So, should you alias jq to DuckDB?
+
+No, but you should know it's there.
+jq is still the better *language* for poking at JSON, and sjq (go read Lemire's post) is in a different league for raw speed.
+What surprised me is how far a general-purpose SQL engine gets just by reading stdin.
+It's {{v:pipe.03.x}}× faster than jq through a pipe, and {{v:redir.03.x}}× when it can seek, with byte-identical output.
+And the moment the filter turns into a join, a window function or a `GROUP BY` over a hundred files, you're already holding the right tool.
+
+Run it yourself:
+
+```bash
+git clone https://github.com/zorndorff/streaming-duckdb-bench && cd streaming-duckdb-bench
+scripts/make_data.sh && scripts/verify.sh && scripts/run_bench.sh
+INPUT=redirect scripts/run_bench.sh
+```
